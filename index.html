@@ -67,11 +67,74 @@
     <div class="status" id="preview-status">Charge ta vidéo pour voir l'aperçu.</div>
   </div>
 
+  <div class="step">
+    <div class="step-title"><span class="step-num">4</span> Jump cut automatique</div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer;">
+      <input type="checkbox" id="jumpcut-enabled" style="width:auto;"/>
+      Retirer automatiquement mes silences/pauses
+    </label>
+    <div class="slider-row" id="jumpcut-settings" style="display:none;">
+      <label>Sensibilité (plus bas = détecte plus de silences)</label>
+      <input type="range" id="silence-threshold" min="-60" max="-20" value="-40"/>
+    </div>
+    <div class="status" id="jumpcut-status"></div>
+  </div>
+
   <button class="btn" id="export-btn" disabled>📥 Exporter la vidéo finale</button>
   <div class="status" id="export-status"></div>
 </div>
 
 <script>
+var silentSegments = [];
+var currentVideoFile = null;
+
+document.getElementById('jumpcut-enabled').addEventListener('change', function(e){
+  document.getElementById('jumpcut-settings').style.display = e.target.checked ? 'block' : 'none';
+});
+
+async function analyzeSilence(file, thresholdDb, minSilenceDuration){
+  var arrayBuffer = await file.arrayBuffer();
+  var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  var audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  var channelData = audioBuffer.getChannelData(0);
+  var sampleRate = audioBuffer.sampleRate;
+  var windowSize = Math.floor(sampleRate * 0.05); // fenêtres de 50ms
+
+  var windows = [];
+  for(var i = 0; i < channelData.length; i += windowSize){
+    var sumSquares = 0, count = 0;
+    var end = Math.min(i + windowSize, channelData.length);
+    for(var j = i; j < end; j++){ sumSquares += channelData[j] * channelData[j]; count++; }
+    var rms = Math.sqrt(sumSquares / count);
+    var db = 20 * Math.log10(rms || 0.00001);
+    windows.push({ time: i / sampleRate, silent: db < thresholdDb });
+  }
+
+  var segments = [];
+  var segStart = null;
+  for(var k = 0; k < windows.length; k++){
+    if(windows[k].silent && segStart === null){
+      segStart = windows[k].time;
+    } else if(!windows[k].silent && segStart !== null){
+      var segEnd = windows[k].time;
+      if(segEnd - segStart >= minSilenceDuration){
+        // Petite marge de chaque côté pour éviter une coupe trop brusque
+        segments.push({ start: segStart + 0.15, end: Math.max(segStart + 0.15, segEnd - 0.15) });
+      }
+      segStart = null;
+    }
+  }
+  audioCtx.close();
+  return segments;
+}
+
+function findSilentSegment(t){
+  for(var i = 0; i < silentSegments.length; i++){
+    if(t >= silentSegments[i].start && t < silentSegments[i].end) return silentSegments[i];
+  }
+  return null;
+}
+</script>
 var srcVideo = document.getElementById('src-video');
 var previewCanvas = document.getElementById('preview-canvas');
 var ctx = previewCanvas.getContext('2d');
@@ -86,6 +149,7 @@ var animFrameId = null;
 document.getElementById('video-input').addEventListener('change', function(e){
   var file = e.target.files[0];
   if(!file) return;
+  currentVideoFile = file;
   srcVideo.src = URL.createObjectURL(file);
   srcVideo.loop = true;
   srcVideo.onloadedmetadata = function(){
@@ -163,8 +227,23 @@ document.getElementById('export-btn').addEventListener('click', async function()
   var btn = this;
   btn.disabled = true;
   var statusEl = document.getElementById('export-status');
-  statusEl.textContent = '⏳ Préparation de l\'exportation...';
+  var jumpcutOn = document.getElementById('jumpcut-enabled').checked;
 
+  silentSegments = [];
+  if(jumpcutOn && currentVideoFile){
+    statusEl.textContent = '🔍 Analyse des silences en cours...';
+    var thresholdDb = parseInt(document.getElementById('silence-threshold').value, 10);
+    try {
+      silentSegments = await analyzeSilence(currentVideoFile, thresholdDb, 0.5);
+      var totalRemoved = silentSegments.reduce(function(s,seg){ return s + (seg.end - seg.start); }, 0);
+      document.getElementById('jumpcut-status').textContent = '✂️ ' + silentSegments.length + ' silence(s) détecté(s), ' + totalRemoved.toFixed(1) + 's retirées.';
+    } catch(e){
+      console.log('[JumpCut] Erreur analyse:', e);
+      document.getElementById('jumpcut-status').textContent = '⚠️ Analyse impossible — export sans jump cut.';
+    }
+  }
+
+  statusEl.textContent = '⏳ Préparation de l\'exportation...';
   srcVideo.currentTime = 0;
   await new Promise(function(resolve){ srcVideo.onseeked = resolve; });
   srcVideo.play();
@@ -198,12 +277,28 @@ document.getElementById('export-btn').addEventListener('click', async function()
 
   recorder.start();
   statusEl.textContent = '🔴 Enregistrement en cours — attends la fin de la vidéo...';
-
-  srcVideo.onended = function(){
-    recorder.stop();
-    srcVideo.loop = true;
-  };
   srcVideo.loop = false;
+
+  // Boucle d'exportation dédiée — vérifie à chaque image si on est dans un
+  // silence à sauter (jump cut), plutôt que la simple boucle d'aperçu.
+  var exportRunning = true;
+  function exportLoop(){
+    if(!exportRunning) return;
+    if(srcVideo.ended){
+      recorder.stop();
+      srcVideo.loop = true;
+      exportRunning = false;
+      return;
+    }
+    var seg = jumpcutOn ? findSilentSegment(srcVideo.currentTime) : null;
+    if(seg){
+      srcVideo.currentTime = seg.end;
+    } else {
+      drawFrame();
+    }
+    requestAnimationFrame(exportLoop);
+  }
+  exportLoop();
 });
 </script>
 </body>
