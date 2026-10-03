@@ -60,7 +60,7 @@
   <div class="step">
     <div class="step-title"><span class="step-num">3</span> Ajuste la sensibilité du vert</div>
     <div class="slider-row">
-      <label>Sensibilité (si des restes de vert apparaissent, augmente)</label>
+      <label>Sensibilité (s'il reste du vert, augmente ; si tu disparais, baisse)</label>
       <input type="range" id="sensitivity" min="20" max="120" value="60"/>
     </div>
     <canvas id="preview-canvas"></canvas>
@@ -229,10 +229,13 @@ document.getElementById('video-input').addEventListener('change', function(e){
   srcVideo.src = URL.createObjectURL(file);
   srcVideo.loop = true;
   srcVideo.onloadedmetadata = function(){
-    previewCanvas.width = srcVideo.videoWidth;
-    previewCanvas.height = srcVideo.videoHeight;
-    offCanvas.width = srcVideo.videoWidth;
-    offCanvas.height = srcVideo.videoHeight;
+    // Les vidéos de téléphone sont souvent très grandes (4K) : on travaille sur
+    // une taille réduite (1280 max) pour que ça reste fluide sur un téléphone.
+    var echelle = Math.min(1, 1280 / Math.max(srcVideo.videoWidth, srcVideo.videoHeight));
+    var lw = Math.max(2, Math.round(srcVideo.videoWidth * echelle));
+    var lh = Math.max(2, Math.round(srcVideo.videoHeight * echelle));
+    previewCanvas.width = lw; previewCanvas.height = lh;
+    offCanvas.width = lw; offCanvas.height = lh;
     srcVideo.play();
     videoReady = true;
     document.getElementById('export-btn').disabled = false;
@@ -259,16 +262,23 @@ document.querySelectorAll('.swatch').forEach(function(sw){
   });
 });
 
+var dernierDiag = null, compteurDiag = 0;
 function applyChromaKey(imageData, sensitivity){
   var data = imageData.data;
+  // Plus la sensibilité est haute, plus on retire de vert (seuil plus bas).
+  var seuil = (150 - sensitivity) / 3;
+  var vides = 0, retires = 0;
   for(var i = 0; i < data.length; i += 4){
     var r = data[i], g = data[i+1], b = data[i+2];
     // Vert dominant = fond à retirer. La sensibilité ajuste à quel point le vert
     // doit dominer le rouge et le bleu pour être considéré comme fond.
-    if(g > r + sensitivity/2 && g > b + sensitivity/2 && g > 60){
+    if(data[i+3] === 0 || (r + g + b) < 12) vides++;
+    if(g > r + seuil && g > b + seuil && g > 60){
       data[i+3] = 0;
+      retires++;
     }
   }
+  dernierDiag = { total: data.length / 4, vides: vides, retires: retires };
   return imageData;
 }
 
@@ -284,12 +294,26 @@ function drawFrame(){
   }
 
   // 2. Dessine la vidéo sur un canvas séparé, retire le vert, superpose par-dessus
+  offCtx.clearRect(0, 0, w, h);
   offCtx.drawImage(srcVideo, 0, 0, w, h);
   var frame = offCtx.getImageData(0, 0, w, h);
   var sensitivity = parseInt(document.getElementById('sensitivity').value, 10);
   applyChromaKey(frame, sensitivity);
   offCtx.putImageData(frame, 0, 0);
   ctx.drawImage(offCanvas, 0, 0);
+
+  // Petit diagnostic affiché sous l'aperçu (mis à jour 2 fois par seconde environ)
+  if(dernierDiag && (compteurDiag++ % 15 === 0)){
+    var st = document.getElementById('preview-status');
+    var pVide = dernierDiag.vides / dernierDiag.total, pRet = dernierDiag.retires / dernierDiag.total;
+    if(pVide > 0.97){
+      st.textContent = "⚠️ Ton navigateur n'arrive pas à lire l'image de cette vidéo (format non pris en charge). Essaie une vidéo en format MP4 standard.";
+    } else if(pRet > 0.97){
+      st.textContent = "⚠️ Presque toute l'image est retirée (" + Math.round(pRet*100) + " %). Baisse la sensibilité.";
+    } else {
+      st.textContent = "Aperçu en direct — vert retiré : " + Math.round(pRet*100) + " % de l'image.";
+    }
+  }
 
   // 3. Incruste le sous-titre correspondant au moment actuel, si activé
   if(document.getElementById('subtitles-enabled').checked && subtitleSegments.length){
